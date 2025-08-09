@@ -8,7 +8,7 @@ __pycache__/
 .venv/
 venv/
 ENV/
-
+raga_env/
 # Ignore dataset files
 PallaviData/
 
