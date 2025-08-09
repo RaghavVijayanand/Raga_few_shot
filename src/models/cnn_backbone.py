@@ -3,7 +3,16 @@ import torch.nn as nn
 import torchvision.models as models
 
 class CNNBackbone(nn.Module):
-    def __init__(self, out_dim=128, pretrained=True, input_height=128, input_width=216):
+    def __init__(self, out_dim=128, pretrained=True, input_height=24, input_width=216):
+        """
+        CNN Backbone for CFCC features.
+        
+        Args:
+            out_dim: Output feature dimension
+            pretrained: Whether to use pretrained ResNet
+            input_height: Height of CFCC features (min(n_cfcc, n_chroma) + n_chroma = 12 + 12 = 24)
+            input_width: Width of CFCC features (time frames)
+        """
         super().__init__()
         # Use a small ResNet (e.g., ResNet18) as backbone
         self.resnet = models.resnet18(pretrained=pretrained)

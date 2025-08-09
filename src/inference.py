@@ -9,7 +9,7 @@ import torchaudio
 import numpy as np
 import os
 import librosa
-from src.features import audio_to_melspec
+from src.features import extract_cfcc_features
 from src.models.cnn_backbone import CNNBackbone
 from src.models.kan import KANHead
 from src.models.proto_head import ProtoNetHead
@@ -19,15 +19,22 @@ import argparse
 # Constants
 SAMPLE_RATE = 22050
 DURATION = 5.0  # seconds
-HOP_LENGTH = 512  # for melspec
+HOP_LENGTH = 512  # for CFCC feature extraction
 MAX_TIME_FRAMES = int(np.ceil(DURATION * SAMPLE_RATE / HOP_LENGTH))  # Calculate max time frames
-N_MELS = 128
+N_CHROMA = 12  # Number of chroma bins
+N_CFCC = 13    # Number of CFCC coefficients
+CFCC_HEIGHT = N_CHROMA + N_CFCC  # Total CFCC feature height
 
 def load_model(checkpoint_path, feat_dim=128):
     """Load trained model from checkpoint"""
+    # Note: CFCC can only produce as many coefficients as chroma bins (12)
+    # So even if we request 13 CFCC coefficients, we get min(13, 12) = 12
+    n_cfcc_actual = min(N_CFCC, N_CHROMA)
+    cfcc_height = N_CHROMA + n_cfcc_actual # 12 + 12 = 24
+
     # Initialize models
-    cnn = CNNBackbone(out_dim=feat_dim, input_height=N_MELS, input_width=MAX_TIME_FRAMES)
-    kan = KANHead(in_dim=feat_dim, hidden_dim=64, out_dim=feat_dim)
+    cnn = CNNBackbone(out_dim=feat_dim, input_height=cfcc_height)
+    kan = KANHead(in_dim=feat_dim, hidden_dim=128, out_dim=feat_dim)  # Match training config
     
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -40,7 +47,7 @@ def load_model(checkpoint_path, feat_dim=128):
     
     return cnn, kan
 
-def create_support_set(dataset_path, cnn, kan, n_way=5, n_shot=3, feat_dim=128):
+def create_support_set(dataset_path, cnn, kan, n_way=None, n_shot=2, feat_dim=128):
     """Create a support set from the dataset for few-shot inference"""
     import os
     import random
@@ -54,11 +61,22 @@ def create_support_set(dataset_path, cnn, kan, n_way=5, n_shot=3, feat_dim=128):
         if not os.path.isdir(raga_dir):
             continue
         files = [os.path.join(raga_dir, fname) for fname in os.listdir(raga_dir) if fname.endswith('.wav')]
-        if files:
+        if len(files) >= n_shot:  # Only include ragas with enough files
             ragas[raga] = files
     
-    # Select n_way random ragas
-    selected_ragas = random.sample(list(ragas.keys()), min(n_way, len(ragas)))
+    # Use all available ragas if n_way is not specified
+    if n_way is None:
+        n_way = len(ragas)
+    else:
+        n_way = min(n_way, len(ragas))
+    
+    # Select ragas (all of them for inference, or random subset if specified)
+    if n_way == len(ragas):
+        selected_ragas = list(ragas.keys())
+    else:
+        selected_ragas = random.sample(list(ragas.keys()), n_way)
+    
+    print(f"Creating support set with {len(selected_ragas)} ragas: {selected_ragas}")
     
     support_data, support_labels = [], []
     label_map = {}
@@ -70,35 +88,39 @@ def create_support_set(dataset_path, cnn, kan, n_way=5, n_shot=3, feat_dim=128):
         
         # Process support examples
         for j in range(len(selected_files)):
-            path = selected_files[j]
-            audio, sr = torchaudio.load(path)
-            audio = audio.mean(dim=0).numpy()  # mono
-            if sr != SAMPLE_RATE:
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
-            
-            # Random crop to 5 seconds
-            if len(audio) > int(DURATION * SAMPLE_RATE):
-                max_offset = len(audio) - int(DURATION * SAMPLE_RATE)
-                offset = random.randint(0, max_offset)
-                audio = audio[offset:offset + int(DURATION * SAMPLE_RATE)]
-            else:
-                # Pad if too short
-                pad_len = int(DURATION * SAMPLE_RATE) - len(audio)
-                audio = np.pad(audio, (0, pad_len))
-            
-            # Feature extraction
-            melspec = audio_to_melspec(audio, SAMPLE_RATE, n_mels=N_MELS, max_time_frames=MAX_TIME_FRAMES)
-            melspec = torch.tensor(melspec).float()
-            support_data.append(melspec)
-            support_labels.append(i)
+            try:
+                path = selected_files[j]
+                audio, sr = torchaudio.load(path)
+                audio = audio.mean(dim=0).numpy()  # mono
+                if sr != SAMPLE_RATE:
+                    audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+                
+                # Random crop to 5 seconds
+                if len(audio) > int(DURATION * SAMPLE_RATE):
+                    max_offset = len(audio) - int(DURATION * SAMPLE_RATE)
+                    offset = random.randint(0, max_offset)
+                    audio = audio[offset:offset + int(DURATION * SAMPLE_RATE)]
+                else:
+                    # Pad if too short
+                    pad_len = int(DURATION * SAMPLE_RATE) - len(audio)
+                    audio = np.pad(audio, (0, pad_len))
+                
+                # Feature extraction
+                cfcc_features = extract_cfcc_features(audio, SAMPLE_RATE, n_chroma=N_CHROMA, n_cfcc=N_CFCC, max_time_frames=MAX_TIME_FRAMES)
+                cfcc_features = torch.tensor(cfcc_features).float()
+                support_data.append(cfcc_features)
+                support_labels.append(i)
+            except Exception as e:
+                print(f"Error processing {path}: {e}")
+                continue
         
         label_map[i] = raga
     
     # Extract features
     with torch.no_grad():
-        support_data = torch.stack(support_data).unsqueeze(1)  # (n_way*n_shot, 1, n_mels, time)
+        support_data = torch.stack(support_data).unsqueeze(1)  # (n_way*n_shot, 1, cfcc_height, time)
         support_feats = cnn(support_data)
-        support_feats = kan(support_feats)
+        support_feats = kan(support_feats)  # Apply KAN transformation
     
     return support_feats, torch.tensor(support_labels), label_map
 
@@ -137,21 +159,28 @@ def segment_audio(audio_path, cnn, kan, proto, support_feats, support_labels,
         if len(audio_seg) == 0:
             continue
 
-        # Convert to mel spectrogram
-        # audio_to_melspec pads if too short, and might truncate if too long based on MAX_TIME_FRAMES
-        melspec = audio_to_melspec(audio_seg, sr, n_mels=N_MELS, max_time_frames=MAX_TIME_FRAMES)
-        melspec = torch.tensor(melspec).unsqueeze(0).unsqueeze(0).float()  # (1,1,n_mels,time)
+        # Convert to CFCC features
+        # extract_cfcc_features pads if too short, and might truncate if too long based on MAX_TIME_FRAMES
+        cfcc_features = extract_cfcc_features(audio_seg, sr, n_chroma=N_CHROMA, n_cfcc=N_CFCC, max_time_frames=MAX_TIME_FRAMES)
+        cfcc_features = torch.tensor(cfcc_features).unsqueeze(0).unsqueeze(0).float()  # (1,1,cfcc_height,time)
         
         # Extract features
         with torch.no_grad():
-            feat = cnn(melspec)
+            feat = cnn(cfcc_features)
             feat = kan(feat)
         
         # Classify using prototypical network
         logits = proto(support_feats, support_labels, feat)
+        probs = torch.softmax(logits, dim=1)
         pred = logits.argmax(dim=1).item()
+        confidence = probs.max(dim=1)[0].item()
         
-        segments.append(pred)
+        # Only include predictions with reasonable confidence
+        if confidence > 0.3:  # Threshold for confidence
+            segments.append(pred)
+        else:
+            segments.append(-1)  # Unknown/low confidence
+            
         times.append(start_sample / sr) # Store the start time of the segment
     
     # Add the end time of the last segment to complete the timeline for plotting
@@ -167,7 +196,7 @@ def main():
     parser = argparse.ArgumentParser(description='Raga segmentation using few-shot learning')
     parser.add_argument('--audio', type=str, required=True, help='Path to audio file for segmentation')
     parser.add_argument('--model', type=str, default='checkpoints/final_model.pth', help='Path to trained model')
-    parser.add_argument('--dataset', type=str, default='PallaviData', help='Path to dataset for support set')
+    parser.add_argument('--dataset', type=str, default='../PallaviData', help='Path to dataset for support set')
     parser.add_argument('--output', type=str, default='segmentation.png', help='Output visualization path')
     parser.add_argument('--window', type=float, default=5.0, help='Window size in seconds (not used with silence skipping)')
     parser.add_argument('--hop', type=float, default=2.5, help='Hop size in seconds (not used with silence skipping)')
@@ -184,30 +213,28 @@ def main():
     cnn, kan = load_model(args.model)
     proto = ProtoNetHead()
     
-    # Count the number of ragas in the dataset
+    # Count the number of ragas in the dataset that have enough files
     dataset_path = args.dataset
     num_ragas = 0
     if os.path.isdir(dataset_path):
         for item in os.listdir(dataset_path):
             item_path = os.path.join(dataset_path, item)
             if os.path.isdir(item_path):
-                # Check if it contains .wav files to be sure it's a raga directory
-                has_wav = False
-                for fname in os.listdir(item_path):
-                    if fname.endswith('.wav'):
-                        has_wav = True
-                        break
-                if has_wav:
+                # Check if it contains enough .wav files
+                wav_files = [fname for fname in os.listdir(item_path) if fname.endswith('.wav')]
+                if len(wav_files) >= 2:  # Need at least 2 files for 2-shot
                     num_ragas += 1
 
-    # Ensure n_way is at least 1 and not more than available ragas
-    n_way = max(1, num_ragas) 
-    n_shot = 5 # User requested 5 shots
+    # Use all available ragas for inference
+    n_way = num_ragas
+    n_shot = 2  # 2-shot as requested
+    
+    print(f"Found {num_ragas} ragas with sufficient files for 2-shot learning")
 
     # Create support set
     print("Creating support set...")
     support_feats, support_labels, label_map = create_support_set(
-        args.dataset, cnn, kan, n_way=n_way, n_shot=n_shot
+        args.dataset, cnn, kan, n_way=None, n_shot=n_shot  # Use all ragas
     )
     
     # Segment audio using silence skipping
@@ -221,7 +248,10 @@ def main():
     print("Segmentation results:")
     if segments: # Only print if there are segments
         for i, (start, end, label) in enumerate(zip(times[:-1], times[1:], segments)):
-            print(f"{start:.2f}s - {end:.2f}s: {label_map[label]}")
+            if label == -1:
+                print(f"{start:.2f}s - {end:.2f}s: Unknown/Low confidence")
+            else:
+                print(f"{start:.2f}s - {end:.2f}s: {label_map[label]}")
     else:
         print("No sound segments detected.")
     
